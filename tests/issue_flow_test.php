@@ -186,7 +186,16 @@ $t->ok(
     $certificate2 !== null && \in_array('*.example.com', $certificate2->getDomains(), true),
     '证书里应当包含通配符域名'
 );
-$t->equals(9, \count($dnsSolver->calls), '三个域名各走一遍 prepare/verify/cleanup，共 9 次调用');
+$t->equals(
+    [
+        'prepare:example.com', 'verify:example.com',
+        'prepare:www.example.com', 'verify:www.example.com',
+        'prepare:*.example.com', 'verify:*.example.com',
+        'cleanup:example.com', 'cleanup:www.example.com', 'cleanup:*.example.com',
+    ],
+    $dnsSolver->calls,
+    'dns-01 必须先备完全部记录再统一验证、最后统一清理（同名 TXT 共存，防 CA 缓存旧值）'
+);
 
 $t->group('通配符必须用 dns-01');
 

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Mci\Acme\Service;
 
 use Mci\Acme\Challenge\ChallengeSolverInterface;
+use Mci\Acme\Challenge\Dns01\DnsSolver;
 use Mci\Acme\Crypto\Certificate;
 use Mci\Acme\Crypto\Csr;
 use Mci\Acme\Crypto\KeyPair;
@@ -192,6 +193,7 @@ class CertificateIssuer
         $solver = $request->getSolver();
         $accountKey = $client->getAccountKey();
 
+        $pending = [];
         foreach ($order->getAuthorizationUrls() as $url) {
             $authorization = $client->fetchAuthorization($url);
 
@@ -210,8 +212,117 @@ class CertificateIssuer
                 ));
             }
 
+            $pending[] = $authorization;
+        }
+
+        // dns-01 必须「全部备好再统一验证」，见 satisfyAllDns 的说明
+        if ($solver->getType() === DnsSolver::TYPE) {
+            $this->satisfyAllDns($client, $pending, $solver, $accountKey, $request);
+            return;
+        }
+
+        foreach ($pending as $authorization) {
             $this->satisfyOne($client, $authorization, $solver, $accountKey, $request);
         }
+    }
+
+    /**
+     * dns-01 专用：先加完全部 TXT 记录并各自确认生效，再逐个通知 CA 验证，
+     * 最后统一清理。
+     *
+     * 为什么不能逐条「加→验→删」：主域与通配符（example.com 与
+     * *.example.com）的验证记录是**同名的** _acme-challenge.example.com，
+     * 只是值不同。验完第一个就删掉它的记录再加第二个时，CA 的验证解析器
+     * 会把第一次查到的答案按 TTL 缓存住，第二个域名的验证读到的是上一个
+     * 域名的旧值——Let's Encrypt 的多视角二次验证就这样判出
+     * "Incorrect TXT record"（2026-10-22 实测，主域+通配符同单必现）。
+     * 让全部记录同时在线，CA 第一次查询就能拿到所有值，缓存里的答案
+     * 对每个域名都是对的。
+     *
+     * @param array<int, Authorization> $authorizations
+     */
+    private function satisfyAllDns(
+        AcmeClient $client,
+        array $authorizations,
+        ChallengeSolverInterface $solver,
+        KeyPair $accountKey,
+        IssueRequest $request
+    ): void {
+        $prepared = [];
+
+        try {
+            // 阶段一：全部 prepare + 自检。任何一个没就绪就整体放弃，
+            // 不去敲 CA 的门——失败的验证会消耗该域名的失败配额
+            foreach ($authorizations as $authorization) {
+                $challenge = $this->pickChallenge($authorization, $solver);
+
+                $this->logger->info(sprintf('正在验证 %s（%s）', $authorization->getDomain(), $solver->getType()));
+
+                $solver->prepare($challenge, $accountKey);
+                $prepared[] = [$authorization, $challenge];
+
+                if (!$solver->verify($challenge, $accountKey)) {
+                    throw new ChallengeException(sprintf(
+                        '%s 的验证条件没能就绪（%s），已放弃通知 CA 以免浪费验证配额',
+                        $authorization->getDomain(),
+                        $solver->getType()
+                    ));
+                }
+            }
+
+            // 阶段二：逐个触发并轮询结果，期间所有 TXT 记录都在线上
+            foreach ($prepared as $pair) {
+                [$authorization, $challenge] = $pair;
+
+                $challenge = $client->triggerChallenge($challenge);
+                $challenge = $this->pollChallenge($client, $challenge, $solver, $request->getChallengeTimeout());
+
+                if (!$challenge->isValid()) {
+                    throw new ChallengeException(sprintf(
+                        '%s 的 %s 验证失败：%s',
+                        $authorization->getDomain(),
+                        $solver->getType(),
+                        $challenge->getErrorMessage() !== '' ? $challenge->getErrorMessage() : '状态为 ' . $challenge->getStatus()
+                    ));
+                }
+
+                $this->logger->info(sprintf('%s 验证通过', $authorization->getDomain()));
+            }
+        } finally {
+            // 阶段三：统一清理。失败时尤其重要——残留的 TXT 记录
+            // 会让下一次验证读到过期的值
+            foreach ($prepared as $pair) {
+                try {
+                    $solver->cleanup($pair[1], $accountKey);
+                } catch (\Throwable $e) {
+                    $this->logger->warning(sprintf(
+                        '清理 %s 的验证记录失败：%s',
+                        $pair[0]->getDomain(),
+                        $e->getMessage()
+                    ));
+                }
+            }
+        }
+    }
+
+    /**
+     * 从授权里挑出当前求解器能用的那个挑战，挑不到就说明 CA 不支持这种验证方式
+     */
+    private function pickChallenge(Authorization $authorization, ChallengeSolverInterface $solver): Challenge
+    {
+        $challenge = $authorization->findChallenge($solver->getType());
+
+        if ($challenge === null) {
+            throw new ChallengeException(sprintf(
+                '%s 不支持 %s 验证方式，CA 提供的是：%s。%s',
+                $authorization->getDomain(),
+                $solver->getType(),
+                implode(', ', $authorization->getAvailableTypes()),
+                $authorization->isWildcard() ? '通配符域名只能用 dns-01' : ''
+            ));
+        }
+
+        return $challenge;
     }
 
     private function satisfyOne(
@@ -222,17 +333,7 @@ class CertificateIssuer
         IssueRequest $request
     ): void {
         $domain = $authorization->getDomain();
-        $challenge = $authorization->findChallenge($solver->getType());
-
-        if ($challenge === null) {
-            throw new ChallengeException(sprintf(
-                '%s 不支持 %s 验证方式，CA 提供的是：%s。%s',
-                $domain,
-                $solver->getType(),
-                implode(', ', $authorization->getAvailableTypes()),
-                $authorization->isWildcard() ? '通配符域名只能用 dns-01' : ''
-            ));
-        }
+        $challenge = $this->pickChallenge($authorization, $solver);
 
         $this->logger->info(sprintf('正在验证 %s（%s）', $domain, $solver->getType()));
 
